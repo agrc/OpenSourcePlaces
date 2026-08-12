@@ -648,7 +648,6 @@ def add_overpass_fields():
     overpass_start_time = time.time()
     #: Get data from Overpass query
     print("Pulling additional data from Overpass API ...")
-    # query_string = '[out:json];area[name="Utah"]->.utah;nwr[!highway][name](area.utah);out center;'
     query_string = """
     [out:json][timeout:300][maxsize:1073741824];
     area["ISO3166-2"="US-UT"]["admin_level"="4"]->.utah;
