@@ -143,8 +143,33 @@ def create_gdb():
 
 #: Retrieve Overpass API data with requests, convert to dataframe
 def get_overpass_df(query_string):
-    r = requests.get(query_string)
-    df = pd.DataFrame(r.json()['elements'])
+    #: Add alternate URL options (8/11/2026)
+    # url = "https://overpass.private.coffee/api/interpreter"
+    # url = "https://lz4.overpass-api.de/api/interpreter"
+    url = "https://overpass-api.de/api/interpreter"
+    overpass_query = query_string
+
+    #: Build headers to satisfy API filters
+    headers = {
+    "User-Agent": "UtahOpenSourcePlaces/1.0 (Contact: https://gis.utah.gov/products/sgid/society/open-source-places/)",
+    "Accept": "application/json, */*",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+}
+    payload = {'data': overpass_query}
+
+    #: Use POST request
+    r = requests.post(url=url,
+    data=payload,
+    headers=headers,
+    timeout=300
+)
+    
+    #: Pull response into a dataframe
+    if r.status_code == 200:
+        print("Success! Parsing JSON data...")
+        df = pd.DataFrame(r.json()['elements'])
+    else:
+        print(f"Server returned status: {r.status_code}")
 
     return df
 
