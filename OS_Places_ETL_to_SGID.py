@@ -151,10 +151,10 @@ def get_overpass_df(query_string):
 
     #: Build headers to satisfy API filters
     headers = {
-    "User-Agent": "UtahOpenSourcePlaces/1.0 (Contact: https://gis.utah.gov/products/sgid/society/open-source-places/)",
-    "Accept": "application/json, */*",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
-}
+        "User-Agent": "UtahOpenSourcePlaces/1.0 (Contact: https://gis.utah.gov/products/sgid/society/open-source-places/)",
+        "Accept": "application/json, */*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+    }
     payload = {'data': overpass_query}
 
     #: Use POST request
