@@ -253,7 +253,6 @@ def add_ev_chargers():
     #: Function to build EV charger data and append into combined_places
     #: Get EV charger data from Overpass query
     print("Pulling additional data from Overpass API ...")
-    # ev_query_string = '[out:json];area[name="Utah"]->.utah;(node["amenity"="charging_station"](area.utah);way["amenity"="charging_station"](area.utah);relation["amenity"="charging_station"](area.utah););out geom;out center;'
     ev_query_string = """
     [out:json][timeout:180];
     area["ISO3166-2"="US-UT"]["admin_level"="4"]->.searchArea;
