@@ -8,6 +8,8 @@ Script to download OSM data and ETL into Open Source Places schema for SGID
 23 March 2022: first version of code (EMN)
 """
 
+import hashlib
+import json
 import os
 import time
 
@@ -143,35 +145,77 @@ def create_gdb():
 
 #: Retrieve Overpass API data with requests, convert to dataframe
 def get_overpass_df(query_string):
-    #: Add alternate URL options (8/11/2026)
-    # url = "https://overpass.private.coffee/api/interpreter"
-    # url = "https://lz4.overpass-api.de/api/interpreter"
+    """Run one Overpass query with bounded retries and return its elements."""
+    # Keep requests on the primary endpoint. Transient network errors and
+    # temporary server/rate-limit responses are retried below; other HTTP
+    # errors are raised immediately so a failed query cannot look successful.
     url = "https://overpass-api.de/api/interpreter"
-    overpass_query = query_string
 
-    #: Build headers to satisfy API filters
+    # Identify this ETL to the service and send the query as form-encoded data.
     headers = {
         "User-Agent": "UtahOpenSourcePlaces/1.0 (Contact: https://gis.utah.gov/products/sgid/society/open-source-places/)",
         "Accept": "application/json, */*",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     }
-    payload = {'data': overpass_query}
+    payload = {'data': query_string}
+    # These responses and request exceptions are commonly temporary. Keep the
+    # number of attempts finite so a permanently failing query is surfaced.
+    retryable_statuses = {429, 500, 502, 503, 504}
+    max_attempts = 5
 
-    #: Use POST request
-    r = requests.post(url=url,
-        data=payload,
-        headers=headers,
-        timeout=300
-    )
-    
-    #: Pull response into a dataframe
-    if r.status_code == 200:
+    for attempt in range(max_attempts):
+        try:
+            response = requests.post(
+                url=url,
+                data=payload,
+                headers=headers,
+                timeout=150,
+            )
+        except requests.RequestException:
+            # Includes connection and timeout failures. Re-raise the final
+            # exception rather than returning an empty or partial dataframe.
+            if attempt == max_attempts - 1:
+                raise
+            # Exponential backoff reduces repeated load when the endpoint is
+            # struggling, with a cap to keep the wait bounded.
+            delay = min(2 ** attempt, 30)
+            print(f"Overpass request failed; retrying in {delay}s ...")
+            time.sleep(delay)
+            continue
+
+        if response.status_code in retryable_statuses:
+            if attempt == max_attempts - 1:
+                response.raise_for_status()
+
+            # Honor the server's requested wait when supplied; otherwise use
+            # exponential backoff as for network exceptions.
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = min(2 ** attempt, 30)
+            print(
+                f"Overpass returned {response.status_code}; "
+                f"retrying in {delay:g}s ..."
+            )
+            time.sleep(delay)
+            continue
+
+        # Fail fast for non-retryable HTTP errors. On success, retry malformed
+        # JSON because an overloaded proxy can return an incomplete response.
+        response.raise_for_status()
+        try:
+            elements = response.json()["elements"]
+        except requests.exceptions.JSONDecodeError:
+            if attempt == max_attempts - 1:
+                raise
+            delay = min(2 ** attempt, 30)
+            print(f"Overpass returned invalid JSON; retrying in {delay}s ...")
+            time.sleep(delay)
+            continue
+
         print("Success! Parsing JSON data...")
-        df = pd.DataFrame(r.json()['elements'])
-    else:
-        print(f"Server returned status: {r.status_code}")
-
-    return df
+        return pd.DataFrame(elements)
 
 
 #: Copy SGID data layers to local for faster processing
@@ -192,13 +236,14 @@ def create_places():
     #: Add queried POIs into Geodatabase   
     poi_query = """name NOT IN ('', ' ') AND (fclass IN ('archaeological', 'arts_centre', 
     'attraction', 'bank', 'bakery', 'bar', 'beverages', 'butcher', 'cafe', 'camp_site', 
-    'car_dealership', 'car_wash', 'caravan_site', 'chemist', 'cinema', 'clothes', 'college', 'convenience', 
-    'courthouse', 'dentist', 'doctors', 'doityourself', 'embassy', 'fast_food', 'fire_station', 'florist', 
-    'garden_centre', 'general', 'greengrocer', 'guesthouse', 'hairdresser', 'hospital', 'hostel', 'hotel', 
+    'car_dealership', 'car_wash', 'caravan_site', 'chalet', 'chemist', 'cinema', 'clothes', 'college', 'convenience', 
+    'courthouse', 'dentist', 'doctors', 'dog_park', 'doityourself', 'embassy', 'fast_food', 'fire_station', 'florist', 'food_court',
+    'garden_centre', 'general', 'greengrocer', 'guesthouse', 'hairdresser', 'hospital', 'hostel', 'hotel', 'ice_rink',
     'jeweller', 'kindergarten', 'laundry', 'library', 'mall', 'market_place', 'massage', 'memorial', 'monument', 
     'motel', 'museum', 'nightclub', 'nursing_home', 'optician', 'park', 'pharmacy', 'picnic_site', 'post_office',
-    'police', 'pub', 'restaurant', 'ruins', 'school', 'stationery', 'supermarket', 'swimming_pool', 'theatre', 
-    'tourist_info', 'tower', 'town_hall', 'travel_agent', 'university', 'vending_any', 'veterinary', 'viewpoint', 'zoo') 
+    'police', 'prison', 'pub', 'public_bookcase', 'recycling', 'restaurant', 'ruins', 'school', 'stationery', 'supermarket', 'swimming_pool',
+    'theatre', 'theme_park', 'tourist_info', 'tower', 'town_hall', 'travel_agent', 'university', 'vending_any',
+    'veterinary', 'viewpoint', 'water_works', 'zoo') 
     OR fclass LIKE '%shop%' OR fclass LIKE '%store%' OR fclass LIKE '%rental%' OR fclass LIKE '%centre%')"""
         
     arcpy.conversion.FeatureClassToFeatureClass(pois, today_db, pois_FC_name, poi_query)
@@ -213,14 +258,14 @@ def create_places():
     #: Add queried POI Areas into Geodatabase
     poi_areas_query = """name NOT IN ('', ' ') AND (fclass IN ('archaeological', 'arts_centre', 
     'attraction', 'bank', 'bakery', 'bar', 'beverages', 'butcher', 'cafe', 'camp_site', 'car_dealership', 
-    'car_wash', 'caravan_site', 'chemist', 'cinema', 'clothes', 'college', 'convenience', 'courthouse', 'dentist', 
-    'doctors', 'doityourself', 'embassy', 'fast_food', 'fire_station', 'florist', 'garden_centre', 'general', 
-    'greengrocer', 'guesthouse', 'hairdresser', 'graveyard', 'hospital', 'hostel', 'hotel', 'jeweller', 
+    'car_wash', 'caravan_site', 'chalet', 'chemist', 'cinema', 'clothes', 'college', 'convenience', 'courthouse', 'dentist', 
+    'doctors', 'dog_park', 'doityourself', 'embassy', 'fast_food', 'fire_station', 'florist', 'food_court', 'garden_centre', 'general', 
+    'greengrocer', 'guesthouse', 'hairdresser', 'graveyard', 'hospital', 'hostel', 'hotel', 'ice_rink', 'jeweller', 
     'kindergarten', 'laundry', 'library', 'mall', 'market_place', 'massage', 'memorial', 'monument', 'motel', 
     'museum', 'nightclub', 'nursing_home', 'optician', 'park', 'playground', 'pharmacy', 'picnic_site', 
-    'post_office', 'police', 'pub', 'restaurant', 'ruins', 'school', 'shelter', 'stadium', 'stationery', 
-    'supermarket', 'swimming_pool', 'theatre', 'tourist_info', 'tower', 'town_hall', 'travel_agent', 'university', 
-    'vending_any', 'veterinary', 'viewpoint', 'zoo') OR fclass LIKE '%shop%' OR fclass LIKE '%store%' OR fclass LIKE 
+    'post_office', 'police', 'prison', 'pub', 'recycling', 'restaurant', 'ruins', 'school', 'shelter', 'stadium', 'stationery', 
+    'supermarket', 'swimming_pool', 'theatre', 'theme_park', 'tourist_info', 'tower', 'town_hall', 'travel_agent', 'university', 
+    'vending_any', 'veterinary', 'viewpoint', 'water_works', 'zoo') OR fclass LIKE '%shop%' OR fclass LIKE '%store%' OR fclass LIKE 
     '%rental%' OR fclass LIKE '%centre%' OR (fclass = 'golf_course' AND name NOT IN ('', ' ') AND 
     name NOT LIKE '%Hole%' AND name NOT LIKE '%hole%'))"""
     
@@ -253,6 +298,7 @@ def add_ev_chargers():
     #: Function to build EV charger data and append into combined_places
     #: Get EV charger data from Overpass query
     print("Pulling additional data from Overpass API ...")
+    # ev_query_string = '[out:json];area[name="Utah"]->.utah;(node["amenity"="charging_station"](area.utah);way["amenity"="charging_station"](area.utah);relation["amenity"="charging_station"](area.utah););out geom;out center;'
     ev_query_string = """
     [out:json][timeout:180];
     area["ISO3166-2"="US-UT"]["admin_level"="4"]->.searchArea;
@@ -642,21 +688,102 @@ def calc_address(row):
 
 
 def add_overpass_fields():
-    #: Add attributes from Overpass API using spatial dataframes
+    """Fetch Overpass tags for working-place OSM IDs and join them to places.
+
+    The request is limited to IDs in the Geofabrik-derived working feature
+    class, reducing response size and avoiding a statewide download of
+    unrelated OSM elements.
+    """
     
     overpass_start_time = time.time()
     #: Get data from Overpass query
     print("Pulling additional data from Overpass API ...")
-    query_string = """
-    [out:json][timeout:300][maxsize:1073741824];
-    area["ISO3166-2"="US-UT"]["admin_level"="4"]->.utah;
-    (nwr[!highway][name](area.utah););
-    out center qt;
-    """
-    overpass = get_overpass_df(query_string)
-    #: Pare down to necessary fields and ignore 'relations'
+    # ArcGIS may expose OSM IDs as numeric values or strings. Normalize each
+    # to an integer for Overpass, but fail on unexpected formats rather than
+    # silently querying the wrong ID.
+    geofabrik_place_ids = set()
+    with arcpy.da.SearchCursor(combined_places_simple, ['osm_id']) as cursor:
+        for (osm_id,) in cursor:
+            if osm_id is None:
+                continue
+            osm_id = str(osm_id).strip().rsplit('/', 1)[-1]
+            if not osm_id.isdecimal():
+                raise ValueError(f"Unexpected OSM ID value: {osm_id!r}")
+            geofabrik_place_ids.add(int(osm_id))
+
+    if not geofabrik_place_ids:
+        raise ValueError("No OSM IDs found in the working places feature class.")
+
+    # Split the ID set into manageable requests: very long Overpass queries
+    # and large responses are more likely to time out or trigger server errors.
+    # Each batch is independently retryable and checkpointed below.
+    place_ids = sorted(geofabrik_place_ids)
+    id_chunk_size = 500
+    id_chunks = [
+        place_ids[index:index + id_chunk_size]
+        for index in range(0, len(place_ids), id_chunk_size)
+    ]
+    # Keep successful batches in the run's work directory so a rerun can
+    # resume without requesting those batches again. Bump the filename version
+    # when query semantics change, preventing old, broader results being reused.
+    cache_dir = os.path.join(work_dir, 'overpass_fields_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    overpass_tiles = []
+    for tile_number, id_chunk in enumerate(id_chunks, start=1):
+        id_list = ','.join(map(str, id_chunk))
+        # Include a digest of the actual IDs so changed input data does not
+        # accidentally load a checkpoint for a different batch.
+        cache_key = hashlib.sha256(id_list.encode('ascii')).hexdigest()[:16]
+        cache_path = os.path.join(
+            cache_dir,
+            f"v5_tile_{tile_number:04d}_{cache_key}.json",
+        )
+
+        if os.path.exists(cache_path):
+            print(f"Loading cached Overpass tile {tile_number}/{len(id_chunks)} ...")
+            with open(cache_path, 'r', encoding='utf-8') as cache_file:
+                tile_records = json.load(cache_file)
+            if not isinstance(tile_records, list):
+                raise ValueError(f"Invalid Overpass cache file: {cache_path}")
+            # Specify columns so an empty result still has the schema expected
+            # by the concatenation and tag-normalization steps.
+            tile_df = pd.DataFrame(tile_records, columns=['id', 'type', 'tags'])
+        else:
+            print(f"Pulling Overpass tile {tile_number}/{len(id_chunks)} ...")
+            # Keep the query within Utah and request only relevant feature
+            # types/IDs. Nodes are point features; closed ways represent
+            # polygon features. Exclude highway-tagged elements and request
+            # tags only because geometry is not needed for this attribute join.
+            query_string = f"""
+            [out:json][timeout:180];
+            area["ISO3166-2"="US-UT"]["admin_level"="4"]->.utah;
+            (
+              node(id:{id_list})(area.utah)[!highway];
+              way(id:{id_list})(area.utah)[!highway](if:is_closed());
+            );
+            out tags qt;
+            """
+            tile_df = get_overpass_df(query_string).reindex(
+                columns=['id', 'type', 'tags']
+            )
+
+            # Write to a temporary file then replace the checkpoint atomically.
+            # A process interrupted during writing will not leave a partial
+            # cache file that appears to be a completed batch.
+            temp_cache_path = cache_path + '.tmp'
+            with open(temp_cache_path, 'w', encoding='utf-8') as cache_file:
+                json.dump(tile_df.to_dict(orient='records'), cache_file)
+            os.replace(temp_cache_path, cache_path)
+
+        overpass_tiles.append(tile_df)
+
+    # Keep identical OSM IDs of different element types distinct (for example,
+    # a node and a way may share a numeric ID); remove duplicate tile results.
+    overpass = pd.concat(overpass_tiles, ignore_index=True)
+    overpass = overpass.drop_duplicates(subset=['type', 'id'])
+    #: Pare down to necessary fields
     overpass_small = overpass[['id', 'type', 'tags']]
-    overpass_small = overpass_small[overpass_small['type'] != 'relation']
 
     #: Normalize the tags field (dictionary) into separate columns
     print("Normalizing Overpass dataframe ...")
@@ -669,16 +796,27 @@ def add_overpass_fields():
     keep_cols = ['id', 'name', 'amenity', 'cuisine',
             'tourism', 'shop', 'website', 'phone', 'opening_hours', 'type',
             'addr:housenumber', 'addr:street', 'addr:city', 'addr:postcode']
+    for column in keep_cols:
+        if column not in overpass_normal_300.columns:
+            overpass_normal_300[column] = np.nan
     overpass_normal_slim = overpass_normal_300[keep_cols]
 
     #: Filter Overpass data down to rows iwth OSM_ids found in the Geofabrik data
     print("Filtering Overpass data to OSM IDs in working data ...")
-    #: Get list of ids in the geofabrik data
-    geofabrik_place_ids = [str(i).strip("(',)") for i in arcpy.da.SearchCursor(combined_places_simple, 'osm_id')]
-    #: Convert id field to string data type
-    overpass_normal_slim[['id']] = overpass_normal_slim[['id']].astype(str)
+    #: Convert id field to string data type and drop decimals
+    # ArcGIS/pandas can represent IDs as floats; remove only a terminal ".0"
+    # so the text ID matches the normalized Geofabrik ID without truncation.
+    # overpass_normal_slim[['id']] = overpass_normal_slim[['id']].astype(str)
+    overpass_normal_slim['id'] = (
+    overpass_normal_slim['id']
+    .astype('string')
+    .str.replace(r'\.0$', '', regex=True)
+)    
     #: Filter the dataframe
-    overpass_ids = overpass_normal_slim[overpass_normal_slim['id'].isin(geofabrik_place_ids)]
+    geofabrik_place_id_strings = {str(osm_id) for osm_id in geofabrik_place_ids}
+    overpass_ids = overpass_normal_slim[
+        overpass_normal_slim['id'].isin(geofabrik_place_id_strings)
+    ]
 
     #: Calculate OSM full addresses using calc_address function
     print("Calculating OSM addresses ...")
